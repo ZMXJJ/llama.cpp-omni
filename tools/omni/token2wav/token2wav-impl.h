@@ -1,7 +1,7 @@
 #pragma once
 
 #ifdef USE_TRT_VOCODER
-#include "../trt_vocoder.h"
+#include "trt/trt_vocoder.h"
 #endif
 
 #include <cstdint>
@@ -2242,7 +2242,7 @@ class Token2Wav {
     omni::vocoder::voc_hg2_model  voc_model_{};
     omni::vocoder::voc_hg2_runner voc_runner_{};
 #ifdef USE_TRT_VOCODER
-    omni::vocoder::TRTVocoder      trt_vocoder_{};
+    omni::vocoder::TrtVocoder      trt_vocoder_{};
     bool                            use_trt_vocoder_ = false;
 #endif
 

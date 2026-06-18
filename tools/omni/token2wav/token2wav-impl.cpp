@@ -9674,9 +9674,9 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
 #ifdef USE_TRT_VOCODER
     const char * trt_engine = std::getenv("OMNI_TRT_VOCODER_ENGINE");
     if (trt_engine && trt_engine[0]) {
-        omni::vocoder::TRTVocoderConfig cfg;
-        cfg.engine_path = trt_engine;
-        cfg.T_mel       = 100;
+        omni::vocoder::TrtVocoderConfig cfg;
+        cfg.engine_path    = trt_engine;
+        cfg.max_mel_frames = 100;
         if (trt_vocoder_.init(cfg)) {
             use_trt_vocoder_ = true;
             fprintf(stderr, "[TRT] TRT vocoder enabled: %s\n", trt_engine);
@@ -9792,7 +9792,7 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     bool voc_ok = false;
 #ifdef USE_TRT_VOCODER
     if (use_trt_vocoder_) {
-        voc_ok = trt_vocoder_.infer(mel_in_bct.data(), (int)T_mel, wave_bt_out, out_T_audio);
+        voc_ok = trt_vocoder_.run(mel_in_bct.data(), (int)T_mel, wave_bt_out, out_T_audio);
     } else
 #endif
     {

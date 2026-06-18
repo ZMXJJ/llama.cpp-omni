@@ -2,20 +2,32 @@
 
 find_package(Threads REQUIRED)
 
-# TensorRT for TRT-accelerated vocoder
+# TensorRT for TRT-accelerated HiFi-GAN vocoder
 option(USE_TRT_VOCODER "Use TensorRT for HiFi-GAN vocoder" OFF)
 if(USE_TRT_VOCODER)
     find_path(TRT_INCLUDE_DIR NvInfer.h
-              PATHS /usr/include/aarch64-linux-gnu /usr/local/tensorrt/include)
+              PATHS /usr/include/aarch64-linux-gnu
+                    /usr/include/x86_64-linux-gnu
+                    /usr/local/tensorrt/include
+                    $ENV{TRT_SDK}/include)
     find_library(TRT_NVINFER_LIB nvinfer
-                 PATHS /usr/lib/aarch64-linux-gnu /usr/local/tensorrt/lib)
+                 PATHS /usr/lib/aarch64-linux-gnu
+                       /usr/lib/x86_64-linux-gnu
+                       /usr/local/tensorrt/lib
+                       $ENV{TRT_SDK}/lib)
     find_library(TRT_CUDA_LIB cudart
-                 PATHS /usr/local/cuda/lib64 /usr/local/cuda/targets/aarch64-linux/lib)
+                 PATHS /usr/local/cuda/lib64
+                       /usr/local/cuda/targets/aarch64-linux/lib
+                       /usr/local/cuda/targets/x86_64-linux/lib)
+    find_path(CUDA_INCLUDE_DIR cuda_runtime.h
+              PATHS /usr/local/cuda/include
+                    /usr/local/cuda/targets/aarch64-linux/include
+                    /usr/local/cuda/targets/x86_64-linux/include)
     if(TRT_INCLUDE_DIR AND TRT_NVINFER_LIB AND TRT_CUDA_LIB)
         message(STATUS "TensorRT found: ${TRT_INCLUDE_DIR}")
-        set(TRT_FOUND TRUE)
+        get_filename_component(TRT_LIB_DIR ${TRT_NVINFER_LIB} DIRECTORY)
     else()
-        message(WARNING "TensorRT not found — TRT vocoder disabled")
+        message(WARNING "TensorRT not found -- TRT vocoder disabled")
         set(USE_TRT_VOCODER OFF)
     endif()
 endif()
@@ -63,17 +75,20 @@ if(ENABLE_COREML)
     set_source_files_properties(coreml/coreml_t2w_dit.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
-target_link_libraries     (omni PUBLIC ggml llama llama-common)
-target_link_libraries     (omni PRIVATE Threads::Threads)
-
-# TRT vocoder
+# Add TRT vocoder when enabled
 if(USE_TRT_VOCODER)
-    target_sources(omni PRIVATE trt_vocoder.cpp trt_vocoder.h)
-    target_include_directories(omni PRIVATE ${TRT_INCLUDE_DIR})
-    target_include_directories(omni PRIVATE /usr/local/cuda/targets/aarch64-linux/include)
+    target_sources(omni PRIVATE
+        trt/trt_vocoder.h
+        trt/trt_vocoder.cpp
+    )
+    target_include_directories(omni PRIVATE ${TRT_INCLUDE_DIR} ${CUDA_INCLUDE_DIR})
+    target_link_directories(omni PRIVATE ${TRT_LIB_DIR})
     target_link_libraries(omni PRIVATE ${TRT_NVINFER_LIB} ${TRT_CUDA_LIB})
     target_compile_definitions(omni PRIVATE USE_TRT_VOCODER)
 endif()
+
+target_link_libraries     (omni PUBLIC ggml llama llama-common)
+target_link_libraries     (omni PRIVATE Threads::Threads)
 target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
@@ -232,4 +247,16 @@ if(ENABLE_COREML)
     set_target_properties  (${TARGET_T2W_ANE_E2E} PROPERTIES OUTPUT_NAME llama-omni-test-t2w-ane-end2end)
     target_link_libraries  (${TARGET_T2W_ANE_E2E} PRIVATE llama-common omni Threads::Threads)
     target_compile_features(${TARGET_T2W_ANE_E2E} PRIVATE cxx_std_17)
+endif()
+
+# TRT vocoder standalone benchmark
+if(USE_TRT_VOCODER)
+    find_library(CUDA_DRIVER_LIB cuda
+                 PATHS /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu)
+    set(TARGET_TRT_VOCODER_TEST llama-omni-test-trt-vocoder)
+    add_executable         (${TARGET_TRT_VOCODER_TEST} test/test_trt_vocoder.cpp)
+    set_target_properties  (${TARGET_TRT_VOCODER_TEST} PROPERTIES OUTPUT_NAME llama-omni-test-trt-vocoder)
+    target_link_libraries  (${TARGET_TRT_VOCODER_TEST} PRIVATE omni Threads::Threads ${TRT_NVINFER_LIB} ${TRT_CUDA_LIB} ${CUDA_DRIVER_LIB})
+    target_link_directories(${TARGET_TRT_VOCODER_TEST} PRIVATE ${TRT_LIB_DIR})
+    target_compile_features(${TARGET_TRT_VOCODER_TEST} PRIVATE cxx_std_17)
 endif()
