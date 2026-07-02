@@ -302,6 +302,11 @@ int main(int argc, char ** argv) {
         gen_params.max_steps           = json_value(data, "max_steps", 200);
         gen_params.temperature         = json_value(data, "temperature", 1.0f);
 
+        // Optional reference-transcript for continuation (extreme) cloning. When
+        // present alongside reference_audio, we take the higher-fidelity
+        // continuation path instead of audio-only reference cloning.
+        std::string prompt_text = json_value(data, "prompt_text", std::string(""));
+
         VoxCPM2Runtime * rt = nullptr;
         {
             std::lock_guard<std::mutex> lock(state.mutex);
@@ -324,7 +329,11 @@ int main(int argc, char ** argv) {
                     return;
                 }
                 gen_params.reference_sample_rate = ref_sr;
-                wav = rt->generate_with_clone(input, ref_pcm, gen_params);
+                if (!prompt_text.empty()) {
+                    wav = rt->generate_with_continuation(input, prompt_text, ref_pcm, gen_params);
+                } else {
+                    wav = rt->generate_with_clone(input, ref_pcm, gen_params);
+                }
             } else {
                 wav = rt->generate(input, gen_params);
             }
@@ -426,7 +435,10 @@ int main(int argc, char ** argv) {
                     auto p = gen_params;
                     p.reference_sample_rate = ref_sr;
                     VoxCPM2Runtime * mutable_rt = const_cast<VoxCPM2Runtime *>(rt);
-                    std::vector<float> wav = mutable_rt->generate_with_clone(input, ref_pcm, p);
+                    std::string prompt_text = json_value(data, "prompt_text", std::string(""));
+                    std::vector<float> wav = prompt_text.empty()
+                        ? mutable_rt->generate_with_clone(input, ref_pcm, p)
+                        : mutable_rt->generate_with_continuation(input, prompt_text, ref_pcm, p);
                     if (wav.empty()) return false;
                     const size_t chunk_size = sr / 10; // 100ms chunks
                     for (size_t i = 0; i < wav.size(); i += chunk_size) {
