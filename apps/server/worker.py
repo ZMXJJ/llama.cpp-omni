@@ -164,6 +164,7 @@ class DuplexWsMessage(BaseModel):
     audio_base64: Optional[str] = None
     frame_base64_list: Optional[List[str]] = None
     force_listen: Optional[bool] = None  # Force Listen 开关（per-chunk）
+    chunk_id: Optional[int] = None  # 客户端 chunk 序号（可选），result 中以 chunk_index 回显，用于评测链路归因
 
 
 # ============ Worker 主类 ============
@@ -1832,6 +1833,31 @@ async def duplex_ws(ws: WebSocket):
     audio_chunk_stats_task: Optional[asyncio.Task] = None
     dropped_audio_chunk_count = 0
     processed_audio_chunk_count = 0
+    audio_chunk_queue_peak = 0
+    session_summary_sent = False
+
+    async def _send_session_summary():
+        """会话结束时向客户端发送一次背压统计（stop 分支 + finally 兜底，保证只发一次）"""
+        nonlocal session_summary_sent
+        if session_summary_sent:
+            return
+        session_summary_sent = True
+        try:
+            await ws.send_json({
+                "type": "session_summary",
+                "processed_input_count": processed_audio_chunk_count,
+                "dropped_input_count": dropped_audio_chunk_count,
+                "queue_peak": audio_chunk_queue_peak,
+            })
+            logger.info(
+                "[Duplex] session_summary sent: processed=%d dropped=%d queue_peak=%d",
+                processed_audio_chunk_count,
+                dropped_audio_chunk_count,
+                audio_chunk_queue_peak,
+            )
+        except Exception:
+            # 连接可能已关闭，兜底发送失败不影响清理流程
+            pass
 
     async def pause_timeout_watchdog(timeout: float):
         """暂停超时看门狗"""
@@ -1857,6 +1883,10 @@ async def duplex_ws(ws: WebSocket):
             return
 
         t_chunk_start = time.perf_counter()
+        # 评测埋点：本 chunk 开始处理的 epoch 时间戳 + 客户端携带的 chunk_id（可选）
+        process_start_ts = time.time()
+        _client_chunk_id = msg.get("chunk_id")
+        chunk_index = _client_chunk_id if isinstance(_client_chunk_id, int) else None
 
         # 解码音频
         audio_bytes = base64.b64decode(audio_b64)
@@ -1908,6 +1938,8 @@ async def duplex_ws(ws: WebSocket):
 
             result, prefill_ms, prefill_cost, kv_cache_len = await asyncio.to_thread(_duplex_step)
             result.server_send_ts = time.time()
+            result.chunk_index = chunk_index
+            result.process_start_ts = process_start_ts
 
             wall_clock_ms = (time.perf_counter() - t_chunk_start) * 1000
 
@@ -2195,17 +2227,27 @@ async def duplex_ws(ws: WebSocket):
                             """独立异步任务：持续轮询 C++ T2W 生成的 WAV 文件并推送给前端。
                             同时把音频分流到 session_recorder，作为 duplex 右声道数据源。"""
                             poll_interval = 0.1
+                            # 评测埋点：会话内音频段递增序号
+                            audio_seq = 0
                             while True:
                                 try:
                                     audio_b64, _ = await asyncio.to_thread(
                                         worker._collect_wav_output_nowait
                                     )
                                     if audio_b64:
+                                        # 评测埋点：ready_ts 为发现该音频文件的 epoch 时间戳
+                                        ready_ts = time.time()
                                         await ws.send_json({
                                             "type": "audio_only",
                                             "audio_data": audio_b64,
+                                            "audio_seq": audio_seq,
+                                            "ready_ts": ready_ts,
                                         })
-                                        logger.info(f"[WAV poll] sent audio_only ({len(audio_b64)} chars)")
+                                        logger.info(
+                                            f"[WAV poll] sent audio_only "
+                                            f"(seq={audio_seq}, {len(audio_b64)} chars)"
+                                        )
+                                        audio_seq += 1
                                         if session_recorder is not None:
                                             try:
                                                 ai_bytes = base64.b64decode(audio_b64)
@@ -2244,7 +2286,7 @@ async def duplex_ws(ws: WebSocket):
 
                 if audio_chunk_queue.full():
                     try:
-                        _ = audio_chunk_queue.get_nowait()
+                        stale_msg = audio_chunk_queue.get_nowait()
                         audio_chunk_queue.task_done()
                         dropped_audio_chunk_count += 1
                         if dropped_audio_chunk_count % 10 == 1:
@@ -2252,9 +2294,20 @@ async def duplex_ws(ws: WebSocket):
                                 f"[Duplex] audio_chunk backlog detected, dropped stale chunk "
                                 f"(total_dropped={dropped_audio_chunk_count})"
                             )
+                        # 评测埋点：通知客户端该 chunk 被丢弃（回显其 chunk_id，未携带时为 null）
+                        _stale_chunk_id = stale_msg.get("chunk_id") if isinstance(stale_msg, dict) else None
+                        try:
+                            await ws.send_json({
+                                "type": "input_dropped",
+                                "chunk_index": _stale_chunk_id if isinstance(_stale_chunk_id, int) else None,
+                            })
+                        except Exception:
+                            pass
                     except asyncio.QueueEmpty:
                         pass
                 await audio_chunk_queue.put(msg)
+                # 评测埋点：跟踪队列峰值
+                audio_chunk_queue_peak = max(audio_chunk_queue_peak, audio_chunk_queue.qsize())
 
             elif msg_type == "pause":
                 logger.info("Duplex paused")
@@ -2292,6 +2345,8 @@ async def duplex_ws(ws: WebSocket):
                 worker.state.status = WorkerStatus.LOADING
                 worker.state.duplex_pause_time = None
                 worker.duplex_stop()
+                # 评测埋点：结束前发送本会话的背压统计
+                await _send_session_summary()
                 await ws.send_json({"type": "stopped"})
                 break
 
@@ -2303,6 +2358,9 @@ async def duplex_ws(ws: WebSocket):
     except Exception as e:
         logger.error(f"Duplex WebSocket error: {e}", exc_info=True)
     finally:
+        # 评测埋点兜底：异常/断连路径下也尝试发送 session_summary（只发一次，失败静默）
+        await _send_session_summary()
+
         # 录制：finalize（flush recording.json + 更新 meta.json）
         if session_recorder:
             try:

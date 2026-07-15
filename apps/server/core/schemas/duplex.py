@@ -517,6 +517,14 @@ class DuplexGenerateResult(BaseModel):
         None,
         description="服务端发送此 result 的时间戳（time.time()），用于全链路时延分析"
     )
+    chunk_index: Optional[int] = Field(
+        None,
+        description="客户端 audio_chunk 携带的 chunk_id 回显，用于评测链路归因（未携带时为 None）"
+    )
+    process_start_ts: Optional[float] = Field(
+        None,
+        description="服务端开始处理该 chunk 的时间戳（time.time()），用于队列等待时间分析"
+    )
 
 
 # =============================================================================
