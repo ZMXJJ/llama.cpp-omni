@@ -1298,6 +1298,12 @@ class CppBackendWorker:
             "--repeat-penalty", "1.05",
             "--temp", "0.7",
         ]
+        # Allow extra llama-server args via env (threads, batch, etc.),
+        # e.g. CPP_SERVER_EXTRA_ARGS="-t 32 -tb 32" on many-core servers.
+        _extra = os.environ.get("CPP_SERVER_EXTRA_ARGS", "").strip()
+        if _extra:
+            import shlex as _shlex
+            cmd.extend(_shlex.split(_extra))
 
         # Probe VRAM right before launch so the log captures the exact
         # state CUDA will see. This is forensic gold when users report
@@ -1469,7 +1475,9 @@ class CppBackendWorker:
             "model_dir": self.model_dir,
             "tts_bin_dir": tts_bin_dir,
             "tts_gpu_layers": 100,
-            "token2wav_device": _DEFAULT_TOKEN2WAV_DEVICE,
+            # T2W_DEVICE overrides the token2mel device ("gpu:0" / "cpu"),
+            # useful on backends where the flow-matching graph must stay on CPU.
+            "token2wav_device": os.environ.get("T2W_DEVICE", _DEFAULT_TOKEN2WAV_DEVICE),
             "output_dir": self._output_dir,
         }
 

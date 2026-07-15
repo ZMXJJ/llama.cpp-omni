@@ -1651,6 +1651,13 @@ static void * ggml_cann_host_malloc(size_t size) {
     }
 
     void * hostPtr = nullptr;
+    // aclrtMallocHost requires a thread-local ACL context; threads that have
+    // not touched a device yet (e.g. the token2wav worker thread) would fail
+    // here and silently lose pinned memory. Bind the primary device first.
+    int32_t current_device = -1;
+    if (aclrtGetDevice(&current_device) != ACL_SUCCESS) {
+        ggml_cann_set_device(0);
+    }
     aclError err = aclrtMallocHost((void **) &hostPtr, size);
     if (err != ACL_SUCCESS) {
         GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s\n", __func__,
@@ -1866,7 +1873,10 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context& ctx,
             ggml_cann_scale(ctx, dst);
             break;
         case GGML_OP_SQR:
-            GGML_ASSERT(dst->src[1] == nullptr);
+            // SQR is emulated as MUL(x, x) by pointing src[1] at src[0].
+            // The node mutation persists in the graph, so allow re-evaluated
+            // graphs (e.g. streaming token2wav) where src[1] was already set.
+            GGML_ASSERT(dst->src[1] == nullptr || dst->src[1] == dst->src[0]);
             dst->src[1] = dst->src[0];
             ggml_cann_binary_op<aclnn_mul>(ctx, dst);
             break;
@@ -2007,6 +2017,10 @@ static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
         "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
+    // Bind the calling thread to the device: worker threads (e.g. the
+    // token2wav thread) may reach here as their first CANN call, and
+    // aclrtMemcpyAsync requires a thread-local ACL context.
+    ggml_cann_set_device(cann_ctx->device);
     ggml_cann_async_memcpy(cann_ctx, (char *)tensor->data + offset, data, size,
         ACL_MEMCPY_HOST_TO_DEVICE);
 }
@@ -2034,6 +2048,8 @@ static void ggml_backend_cann_get_tensor_async(
                 "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
+    // Same as set_tensor_async: ensure this thread has an ACL context.
+    ggml_cann_set_device(cann_ctx->device);
     ggml_cann_async_memcpy(cann_ctx, data, (char *)tensor->data + offset, size,
         ACL_MEMCPY_DEVICE_TO_HOST);
 
