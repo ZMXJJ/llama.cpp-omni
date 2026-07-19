@@ -292,6 +292,30 @@ llama_context::llama_context(
 
         // resolve automatic Flash Attention use
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            // CANN (Ascend NPU): the fused attention operator (FusedInferAttentionScoreV2)
+            // is numerically unstable on some SOCs under long / multi-image (multimodal)
+            // shapes, producing degraded logits (repeated-token / '?' floods). The default
+            // AUTO probe only checks device placement, not numerical validity, so it would
+            // enable FA here. Force-disable FA on CANN to keep the non-fused attention path,
+            // which is numerically stable. Users who want FA on Ascend can pass --flash-attn on.
+            bool has_cann_device = false;
+            for (auto * dev : model.devices) {
+                if (dev && strncmp(ggml_backend_dev_name(dev), "CANN", 4) == 0) {
+                    has_cann_device = true;
+                    break;
+                }
+            }
+            if (has_cann_device) {
+                cparams.flash_attn = false;
+                params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+                LLAMA_LOG_INFO("%s: Flash Attention was auto, set to disabled (CANN backend, avoids "
+                    "unstable fused attention on multimodal/long shapes)\n", __func__);
+                if (ggml_is_quantized(params.type_v)) {
+                    throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+                }
+            }
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
             if (!gf) {
                 throw std::runtime_error("failed to split graph for Flash Attention check");
