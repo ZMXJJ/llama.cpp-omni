@@ -98,11 +98,15 @@ jobs:
 
       - name: CUDA toolkit
         if: matrix.variant == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.19
-        with:
-          cuda: "12.4.0"
-          method: "network"
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas-dev"]'
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -y
+          # cublas ships under libcublas-*, not the cuda-* prefix the other
+          # components use; asking for cuda-cublas-12-4 fails to resolve.
+          sudo apt-get install -y cuda-nvcc-12-4 cuda-cudart-dev-12-4 libcublas-dev-12-4
+          echo "/usr/local/cuda-12.4/bin" >> "$GITHUB_PATH"
+          echo "CUDA_PATH=/usr/local/cuda-12.4" >> "$GITHUB_ENV"
 
       - name: Build
         run: |
@@ -129,6 +133,8 @@ jobs:
 
   windows:
     runs-on: windows-2022
+    env:
+      VULKAN_VERSION: 1.4.313.2
     strategy:
       fail-fast: false
       matrix:
@@ -144,25 +150,34 @@ jobs:
 
       - name: Vulkan SDK
         if: matrix.variant == 'vulkan'
-        uses: jakoch/install-vulkan-sdk-action@v1.2.0
-        with:
-          vulkan_version: "1.4.309.0"
-          install_runtime: true
-          cache: true
-          stripdown: true
+        # The official installer carries SPIRV-Headers, which ggml-vulkan's
+        # find_package() needs and the trimmed third-party actions drop.
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
 
       - name: CUDA toolkit
         if: matrix.variant == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: ./.github/actions/windows-setup-cuda
         with:
-          cuda: "12.4.0"
-          method: "network"
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+          cuda_version: "12.4"
+
+      - name: Ninja
+        run: choco install ninja
 
       - name: Build
         shell: cmd
+        # MSBuild finds CUDA only through the Visual Studio integration that the
+        # full toolkit installer wires in; Ninja does not need it.
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF ${{ matrix.defines }}
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            ${{ matrix.defines }}
           cmake --build build --config Release --target llama-tts-server -j %NUMBER_OF_PROCESSORS%
 
       - name: Pack
