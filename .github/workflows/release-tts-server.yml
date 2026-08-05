@@ -1,0 +1,214 @@
+name: Release llama-tts-server
+
+# Publishes the per-variant llama-tts-server archives that Lemonade's voxcpm2
+# backend downloads. Upstream llama.cpp-omni releases only the Comni desktop
+# installers, so these are built here instead.
+#
+# Asset names are a contract with Lemonade's VoxCPM2Server::get_install_params():
+#   llama-tts-server-<variant>-linux-x64.tar.gz
+#   llama-tts-server-<variant>-windows-x64.zip
+#   llama-tts-server-metal-macos-arm64.tar.gz
+# Renaming one here breaks installs on the matching platform.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. tts-v0.1.0)"
+        required: true
+  push:
+    tags:
+      - "tts-v*"
+
+permissions:
+  contents: write
+
+env:
+  # The tts- prefix keeps these clear of upstream's v1.0.x Comni tags.
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  macos:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: metal
+            defines: "-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            ${{ matrix.defines }}
+          cmake --build build --config Release --target llama-tts-server -j $(sysctl -n hw.ncpu)
+
+      - name: Pack
+        run: |
+          mkdir -p dist
+          cp LICENSE build/bin/ 2>/dev/null || true
+          tar -czf dist/llama-tts-server-${{ matrix.variant }}-macos-arm64.tar.gz -C build/bin .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-tts-server-${{ matrix.variant }}-macos-arm64
+          path: dist/*.tar.gz
+
+  linux:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            defines: ""
+          - variant: vulkan
+            defines: "-DGGML_VULKAN=ON"
+          - variant: cuda
+            defines: "-DGGML_CUDA=ON"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: matrix.variant == 'cuda'
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: Base dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential cmake libssl-dev
+
+      - name: Vulkan SDK
+        if: matrix.variant == 'vulkan'
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y vulkan-sdk mesa-vulkan-drivers
+
+      - name: CUDA toolkit
+        if: matrix.variant == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.4.0"
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas-dev"]'
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            ${{ matrix.defines }}
+          cmake --build build --config Release --target llama-tts-server -j $(nproc)
+
+      - name: Pack
+        run: |
+          mkdir -p dist
+          cp LICENSE build/bin/ 2>/dev/null || true
+          tar -czf dist/llama-tts-server-${{ matrix.variant }}-linux-x64.tar.gz -C build/bin .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-tts-server-${{ matrix.variant }}-linux-x64
+          path: dist/*.tar.gz
+
+  windows:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            defines: ""
+          - variant: vulkan
+            defines: "-DGGML_VULKAN=ON"
+          - variant: cuda
+            defines: "-DGGML_CUDA=ON"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vulkan SDK
+        if: matrix.variant == 'vulkan'
+        uses: jakoch/install-vulkan-sdk-action@v1.2.0
+        with:
+          vulkan_version: "1.4.309.0"
+          install_runtime: true
+          cache: true
+          stripdown: true
+
+      - name: CUDA toolkit
+        if: matrix.variant == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.4.0"
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+
+      - name: Build
+        shell: cmd
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF ${{ matrix.defines }}
+          cmake --build build --config Release --target llama-tts-server -j %NUMBER_OF_PROCESSORS%
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          # MSVC drops the binary under a per-config subdirectory; everything the
+          # server needs at runtime sits alongside it.
+          $binDir = if (Test-Path build/bin/Release) { "build/bin/Release" } else { "build/bin" }
+          Copy-Item LICENSE $binDir -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$binDir/*" -DestinationPath "dist/llama-tts-server-${{ matrix.variant }}-windows-x64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-tts-server-${{ matrix.variant }}-windows-x64
+          path: dist/*.zip
+
+  release:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          ls -la
+          # Lemonade verifies these against backend_versions.json when the digest
+          # is registered there, so publish them alongside the archives.
+          sha256sum * | tee SHA256SUMS
+          echo "--- paste into backend_versions.json checksums.github ---"
+          while read -r hash name; do
+            [ "$name" = "SHA256SUMS" ] && continue
+            printf '  "%s": "sha256:%s"\n' "$name" "$hash"
+          done < SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" \
+            --title "llama-tts-server $RELEASE_TAG" \
+            --notes "Per-variant \`llama-tts-server\` builds consumed by Lemonade's \`voxcpm2\` backend." \
+            artifacts/* \
+            || gh release upload "$RELEASE_TAG" --repo "${{ github.repository }}" --clobber artifacts/*
