@@ -59,19 +59,33 @@ static ggml_tensor * reshape_conv1d_weight_2d(ggml_context * ctx, ggml_tensor * 
 // and rejects any non-zero left padding (lp0/lp1/lp2/lp3), aborting with
 // "unsupported op 'PAD'". Causal conv1d needs *leading* padding, so we build it
 // from Metal-supported ops instead: construct a zeros block of shape
-// [lp0, ne1, ne2, ne3] (a width-lp0 slice of x scaled by 0) and concat it in
-// front of x along dim 0. For causal conv the pad amount ((kernel-1)*dilation)
-// is always smaller than the sequence length, so the slice is well-defined.
+// [lp0, ne1, ne2, ne3] (a slice of x scaled by 0, so it is a graph node rather
+// than an uninitialized leaf) and concat it in front of x along dim 0.
+//
+// The pad can be wider than the sequence itself: streaming decodes one latent
+// patch at a time, so the first step carries only patch_size frames while the
+// pad stays at (kernel-1)*dilation. Widen the seed slice by doubling instead of
+// assuming a single slice of x is long enough.
 static ggml_tensor * left_pad_dim0(ggml_context * ctx, ggml_tensor * x, int lp0) {
     if (lp0 <= 0) {
         return x;
     }
-    GGML_ASSERT(lp0 <= x->ne[0]);
+
+    const int64_t seed_w = lp0 < x->ne[0] ? lp0 : x->ne[0];
 
     ggml_tensor * slice = ggml_view_4d(ctx, x,
-                                       lp0, x->ne[1], x->ne[2], x->ne[3],
+                                       seed_w, x->ne[1], x->ne[2], x->ne[3],
                                        x->nb[1], x->nb[2], x->nb[3], 0);
     ggml_tensor * zeros = ggml_scale(ctx, ggml_cont(ctx, slice), 0.0f);
+
+    while (zeros->ne[0] < lp0) {
+        zeros = ggml_concat(ctx, zeros, zeros, 0);
+    }
+    if (zeros->ne[0] > lp0) {
+        zeros = ggml_cont(ctx, ggml_view_4d(ctx, zeros,
+                                            lp0, zeros->ne[1], zeros->ne[2], zeros->ne[3],
+                                            zeros->nb[1], zeros->nb[2], zeros->nb[3], 0));
+    }
 
     return ggml_concat(ctx, zeros, x, 0);
 }
