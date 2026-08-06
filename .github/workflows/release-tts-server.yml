@@ -46,6 +46,7 @@ jobs:
             -DCMAKE_INSTALL_RPATH='@loader_path' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_NATIVE=OFF \
+            -DLLAMA_OPENSSL=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             ${{ matrix.defines }}
@@ -86,7 +87,7 @@ jobs:
       - name: Base dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y build-essential cmake libssl-dev
+          sudo apt-get install -y build-essential cmake
 
       - name: Vulkan SDK
         if: matrix.variant == 'vulkan'
@@ -115,6 +116,7 @@ jobs:
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_NATIVE=OFF \
+            -DLLAMA_OPENSSL=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             ${{ matrix.defines }}
@@ -175,6 +177,7 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_NATIVE=OFF ^
+            -DLLAMA_OPENSSL=OFF ^
             -DLLAMA_BUILD_TESTS=OFF ^
             -DLLAMA_BUILD_EXAMPLES=OFF ^
             ${{ matrix.defines }}
