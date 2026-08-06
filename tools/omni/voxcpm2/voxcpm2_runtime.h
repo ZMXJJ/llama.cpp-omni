@@ -139,6 +139,10 @@ struct VoxCPM2Runtime {
                      const std::function<void(const VoxCPM2DecodeStepResult &)> & callback = nullptr);
 
     std::vector<float>   decode_to_waveform(int target_sr = 0);
+    // Decode only the tail of the latent pool, starting at `first_patch`. The
+    // AudioVAE decoder is causal, so a window that carries enough leading
+    // context reproduces the same samples the full-prefix decode would.
+    std::vector<float>   decode_patch_range(int first_patch, int target_sr = 0);
     std::vector<int32_t> tokenize_text(const std::string & text, bool add_special = true, bool parse_special = true);
     std::vector<float>   encode_reference_audio(const std::vector<float> & reference_wav, int sample_rate = 0);
     std::vector<float>   generate_tokens(const std::vector<int32_t> &  token_ids,

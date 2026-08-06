@@ -1284,6 +1284,10 @@ void VoxCPM2Runtime::decode_loop(const VoxCPM2GenerateParams &                  
 }
 
 std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
+    return decode_patch_range(0, target_sr);
+}
+
+std::vector<float> VoxCPM2Runtime::decode_patch_range(int first_patch, int target_sr) {
     clear_error();
     if (!is_initialized) {
         fail("runtime is not initialized");
@@ -1293,14 +1297,22 @@ std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
         return {};
     }
 
+    const int pool_size = static_cast<int>(output_pool.size());
+    if (first_patch < 0) {
+        first_patch = 0;
+    }
+    if (first_patch >= pool_size) {
+        return {};
+    }
+
     const int fdim         = feat_dim();
     const int psize        = patch_size();
-    const int n_patches    = static_cast<int>(output_pool.size());
+    const int n_patches    = pool_size - first_patch;
     const int total_frames = n_patches * psize;
 
     std::vector<float> latents(static_cast<size_t>(total_frames) * static_cast<size_t>(fdim), 0.0f);
     for (int p = 0; p < n_patches; ++p) {
-        const std::vector<float> & patch = output_pool[static_cast<size_t>(p)];
+        const std::vector<float> & patch = output_pool[static_cast<size_t>(first_patch + p)];
         if (patch.size() != static_cast<size_t>(fdim * psize)) {
             fail("output_pool contains an invalid latent patch");
             return {};
@@ -1757,12 +1769,26 @@ std::vector<float> VoxCPM2Runtime::generate_with_continuation(const std::string 
     return decode_to_waveform(params.target_sr);
 }
 
+// Leading latent patches kept as decoder context when streaming. Eight is the
+// smallest window whose output is bit-identical to a full-prefix decode for the
+// shipped decoder_rates; four already drifts (max sample delta 20). Re-measure
+// if the AudioVAE decoder configuration changes — too small a window degrades
+// quality silently rather than failing.
+static constexpr int kStreamingContextPatches = 8;
+
 bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GenerateParams &     params,
                                                        const VoxCPM2AudioChunkCallback & callback) {
     clear_error();
     if (!is_initialized || !state_ready) {
         return fail("streaming decode requires initialized runtime and successful prefill");
     }
+
+    const int psize = patch_size();
+    const int hop   = audio_vae.config.decode_hop_length();
+    if (psize <= 0 || hop <= 0) {
+        return fail("invalid patch size or decoder hop length");
+    }
+    const size_t samples_per_patch = static_cast<size_t>(psize) * static_cast<size_t>(hop);
 
     size_t emitted_samples = 0;
     bool   sent_final      = false;
@@ -1772,15 +1798,27 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
             break;
         }
 
-        std::vector<float> waveform = decode_to_waveform(params.target_sr);
-        if (waveform.size() < emitted_samples) {
-            return fail("streaming waveform unexpectedly shrank");
+        // Re-decoding the whole pool every step costs O(n^2) over an utterance.
+        // The decoder is causal, so a fixed tail window yields the same samples
+        // at a constant cost per step.
+        const int    pool_size    = static_cast<int>(output_pool.size());
+        const int    first_patch  = std::max(0, pool_size - (kStreamingContextPatches + 1));
+        const size_t window_start = static_cast<size_t>(first_patch) * samples_per_patch;
+
+        std::vector<float> window = decode_patch_range(first_patch, params.target_sr);
+        if (window.empty() && !last_error_msg.empty()) {
+            return false;
+        }
+        const size_t window_end = window_start + window.size();
+        if (window_end < emitted_samples || window_start > emitted_samples) {
+            return fail("streaming decode window does not join the emitted audio");
         }
 
         std::vector<float> chunk;
-        if (waveform.size() > emitted_samples) {
-            chunk.assign(waveform.begin() + static_cast<std::ptrdiff_t>(emitted_samples), waveform.end());
-            emitted_samples = waveform.size();
+        if (window_end > emitted_samples) {
+            chunk.assign(window.begin() + static_cast<std::ptrdiff_t>(emitted_samples - window_start),
+                         window.end());
+            emitted_samples = window_end;
         }
 
         const bool is_final = params.stop_on_predictor && i > params.min_steps && step.should_stop;
