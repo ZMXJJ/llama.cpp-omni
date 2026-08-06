@@ -1776,6 +1776,19 @@ std::vector<float> VoxCPM2Runtime::generate_with_continuation(const std::string 
 // quality silently rather than failing.
 static constexpr int kStreamingContextPatches = 8;
 
+// Patches accumulated before each AudioVAE call. Decoding is dominated by the
+// fixed cost of dispatching the ~4.5K-node graph, not by how much audio the
+// call covers: 36 frames measured at 1518 ms against 2300 ms for 264. Batching
+// therefore cuts total time close to linearly (47.5 s -> 18.9 s on a 5.3 s
+// utterance), at the cost of coarser chunks — four patches is 0.32 s of audio,
+// still far below the time spent generating them.
+//
+// It also fixes the opening: emitting one patch at a time starts with windows
+// shorter than the context above, so the first four patches drifted from the
+// buffered decode by up to 29 on a 16-bit sample. Batched output matches it
+// exactly.
+static constexpr int kStreamingEmitPatches = 4;
+
 bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GenerateParams &     params,
                                                        const VoxCPM2AudioChunkCallback & callback) {
     clear_error();
@@ -1792,17 +1805,13 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
 
     size_t emitted_samples = 0;
     bool   sent_final      = false;
-    for (int i = 0; i < params.max_steps; ++i) {
-        VoxCPM2DecodeStepResult step = decode_step(params);
-        if (step.latent_patch.empty()) {
-            break;
-        }
+    int    pending         = 0;
 
-        // Re-decoding the whole pool every step costs O(n^2) over an utterance.
-        // The decoder is causal, so a fixed tail window yields the same samples
-        // at a constant cost per step.
+    // Decode the pending patches plus enough leading context for the causal
+    // convolutions, then hand back only the audio past what was already sent.
+    auto flush = [&](bool is_final) -> bool {
         const int    pool_size    = static_cast<int>(output_pool.size());
-        const int    first_patch  = std::max(0, pool_size - (kStreamingContextPatches + 1));
+        const int    first_patch  = std::max(0, pool_size - (kStreamingContextPatches + pending));
         const size_t window_start = static_cast<size_t>(first_patch) * samples_per_patch;
 
         std::vector<float> window = decode_patch_range(first_patch, params.target_sr);
@@ -1820,10 +1829,27 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
                          window.end());
             emitted_samples = window_end;
         }
+        pending = 0;
 
-        const bool is_final = params.stop_on_predictor && i > params.min_steps && step.should_stop;
         if (callback && (!chunk.empty() || is_final)) {
             callback(chunk, is_final);
+        }
+        return true;
+    };
+
+    for (int i = 0; i < params.max_steps; ++i) {
+        VoxCPM2DecodeStepResult step = decode_step(params);
+        if (step.latent_patch.empty()) {
+            break;
+        }
+        ++pending;
+
+        const bool is_final = params.stop_on_predictor && i > params.min_steps && step.should_stop;
+        if (!is_final && pending < kStreamingEmitPatches) {
+            continue;
+        }
+        if (!flush(is_final)) {
+            return false;
         }
         if (is_final) {
             sent_final = true;
@@ -1832,6 +1858,11 @@ bool VoxCPM2Runtime::decode_streaming_from_ready_state(const VoxCPM2GeneratePara
     }
 
     if (!last_error_msg.empty()) {
+        return false;
+    }
+    // The loop can exit with patches still accumulated — max_steps reached, or
+    // decode_step ran dry — so emit them rather than truncating the utterance.
+    if (!sent_final && pending > 0 && !flush(false)) {
         return false;
     }
     if (callback && !sent_final) {
